@@ -15,7 +15,10 @@ X11 or Wayland: it draws directly on the screen through DRM/KMS, using SDL3
 - **Cancel** exits without changing anything.
 
 Keys: Up/Down/PgUp/PgDn change the selection from any field, Tab moves between
-fields, Enter = OK, Escape = Cancel. Mouse and double-click work too.
+fields, Enter = OK, Escape = Cancel. Mouse and double-click work too, and so
+does the laptop touchpad: pointer motion, the clickpad's physical press, and
+tap-to-click all work as expected (see **Touchpad** below for why that needs
+its own code).
 
 ## Requirements
 
@@ -66,6 +69,13 @@ From a text console (Ctrl+Alt+F2 when X is running):
     kbdlayout -n                  # dry run: print the commands instead
     kbdlayout -L fr               # descriptions in French (default: $LANG)
     kbdlayout -f /path/font.ttf   # use another font
+    kbdlayout -- vi /etc/rc.conf  # apply, then replace kbdlayout with COMMAND
+
+`--` marks the end of kbdlayout's own options: everything after it, including
+anything that looks like a flag, is the command and its arguments. It only
+runs after a successful layout change (not on Cancel, error, or `-n`), and
+replaces the kbdlayout process (`execvp`) rather than running alongside it,
+so e.g. an editor takes over the console directly.
 
 Exit status: 0 = layout applied, 1 = cancelled, 2 = error.
 
@@ -81,6 +91,44 @@ Testing options (also useful off FreeBSD with `SDL_VIDEO_DRIVER=offscreen`):
 `-d DIR` keymap directory, `-p FILE` preselect, `-t TEXT` type text as
 US-positional keys (`~` = CapsLock, `\n` = Enter), `-s shot.bmp` save a
 screenshot and exit.
+
+## Touchpad
+
+Console input goes through SDL's raw evdev backend (there's no libinput on a
+bare vt(4) console), and two things about that backend make a touchpad badly
+behaved there out of the box:
+
+- SDL's udev device classifier never checks the `ID_INPUT_TOUCHPAD` property
+  (only `ID_INPUT_MOUSE` / `ID_INPUT_TOUCHSCREEN`), so a touchpad usually ends
+  up classified as a plain absolute-position mouse, not a touch device. SDL
+  then maps the pad's raw coordinate onto the whole screen on every report, so
+  lifting and re-touching the finger warps the cursor to wherever it lands
+  next -- dropping that one event doesn't help, since even the delta SDL
+  derives from an absolute position still carries the same full-screen
+  scaling.
+- Once the app isn't in SDL's relative mouse mode (true here -- it's a normal
+  cursor-based UI), SDL also rewrites every mouse motion event's device id to
+  one shared id, so individual input devices can't be told apart at the
+  `SDL_Event` level at all.
+
+So `src/main.cpp` reads the touchpad's `/dev/input/eventN` node directly
+(found by matching its reported name against "touchpad", "synaptics",
+"glidepoint" or "alps") and takes exclusive ownership of it with `EVIOCGRAB`,
+which stops the kernel from delivering that device's events to SDL's own file
+descriptor for the same device. SDL's handling of every other device -- a
+real mouse, an IBM TrackPoint, the keyboard -- is completely unaffected. From
+there it computes genuine relative motion from the pad's raw hardware deltas
+(with a small jitter deadzone derived from the device's reported resolution),
+forwards real clicks (`BTN_LEFT`/`RIGHT`/`MIDDLE`, e.g. a clickpad's
+mechanical press) as themselves, and synthesizes tap-to-click itself (a short,
+low-movement touch) since that gesture is normally recognized by libinput or
+the X synaptics driver, neither of which exists on a bare console.
+
+`-g` disables all of this and falls back to plain SDL handling, for
+comparison. `-T SENS` sets the touchpad sensitivity (default `1.0`). If no
+touchpad-looking device is found, or it can't be opened/grabbed, the app just
+behaves as if this feature didn't exist, with no change to how any other
+device works.
 
 Dear ImGui (MIT) is included in `third_party/imgui`. SDL3 (zlib licence) is
 downloaded at build time.
